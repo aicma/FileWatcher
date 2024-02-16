@@ -140,7 +140,10 @@ func main() {
 
 					processedFilePath := filepath.Join(processedPath, filepath.Base(event.Name))
 					err = moveFileToProcessed(event.Name, file, processedFilePath)
-
+					if err != nil {
+						fmt.Println("Error moving file to 'processed' folder:", err)
+						continue
+					}
 				}
 			}
 		case err, ok := <-watcher.Errors:
