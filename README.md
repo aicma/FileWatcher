@@ -3,3 +3,4 @@
 uploads to a hardcoded URL
 
 compile exe for windows with -ldflags "-H windowsui" (among others)
+

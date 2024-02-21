@@ -3,93 +3,44 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/gen2brain/beeep"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"gopkg.in/ini.v1"
 )
 
+type Config struct {
+	FolderToWatch      string
+	SftpServer         string
+	SftpUser           string
+	PrivateKeyPath     string
+	WatchExtensions    []string
+	destionationFolder string
+	processedFolder    string
+}
+
 func main() {
-	// Define the folder to watch and the SFTP server details
-	homedir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Println("Failed to get user home directory:", err)
-		return
-	}
-
-	folderToWatch := filepath.Join(homedir, "AlpineGlow_sync")
-	watchFileExtension := ".cmf"
-	// Define the path to the "processed" folder
-	processedPath := filepath.Join(folderToWatch, "processed")
-
-	sftpServer := "bianca.uberspace.de"
-	sftpUser := "amf"
-	privateKeyPath := filepath.Join(homedir, ".ssh", "id_rsa")
-
-	destionationFolder := "AlpineGlow/Incoming/"
 
 	// Read private key file
-	privateKey, err := os.ReadFile(privateKeyPath)
-	if err != nil {
-		fmt.Println("Failed to read private key:", err)
-		return
-	}
-
 	// Create a new SSH signer
-	signer, err := ssh.ParsePrivateKey(privateKey)
-	if err != nil {
-		fmt.Println("Failed to parse private key:", err)
-		return
-	}
-
 	// Create SSH client config
-	sshConfig := &ssh.ClientConfig{
-		User: sftpUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
 	// Connect to the SFTP server
-	sshClient, err := ssh.Dial("tcp", sftpServer+":22", sshConfig)
-	if err != nil {
-		fmt.Println("Failed to connect to SSH server:", err)
-		return
-	}
-	defer sshClient.Close()
-
 	// Create SFTP client
-	sftpClient, err := sftp.NewClient(sshClient)
-	if err != nil {
-		fmt.Println("Failed to create SFTP client:", err)
-		return
-	}
-	defer sftpClient.Close()
-
 	// Process existing files in the folder
-	err = processExistingFiles(folderToWatch, sftpClient, watchFileExtension)
-	if err != nil {
-		fmt.Println("Error processing existing files:", err)
-	}
-
 	// Create a new file watcher
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		fmt.Println("Failed to create file watcher:", err)
+	// Start watching the specified folder without subfolders
+	config, sftpClient, sshClient, watcher, shouldReturn := initialize()
+	if shouldReturn {
 		return
 	}
 	defer watcher.Close()
-
-	// Start watching the specified folder without subfolders
-	err = watcher.Add(folderToWatch)
-	if err != nil {
-		fmt.Println("Failed to watch folder:", err)
-		return
-	}
-	fmt.Println("Watching " + folderToWatch + " folder for new files...")
+	defer sftpClient.Close()
+	defer sshClient.Close()
 
 	// Process file events
 	for {
@@ -100,7 +51,7 @@ func main() {
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
 
-				if filepath.Ext(event.Name) == watchFileExtension {
+				if hasExtension(event.Name, config.WatchExtensions) {
 					// A new file was created
 					fmt.Println("New file detected:", event.Name)
 
@@ -112,33 +63,25 @@ func main() {
 					}
 					defer file.Close()
 
-					// Create remote file
-					remoteFile, err := sftpClient.Create(destionationFolder + filepath.Base(event.Name))
+					err = copyFileToSftp(file, sftpClient, config.destionationFolder)
 					if err != nil {
-						fmt.Println("Failed to create remote file:", err)
-						continue
-					}
-					fmt.Println("Copying from " + file.Name() + " to " + remoteFile.Name())
-					// Copy the contents of the local file to the remote file
-					_, err = io.Copy(remoteFile, file)
-					if err != nil {
-						fmt.Println("Failed to upload file to SFTP server:", err)
+						fmt.Println("Error copying file to SFTP server:", err)
 						continue
 					}
 
 					fmt.Println("File uploaded successfully")
 
 					// Check if the "processed" folder exists
-					if _, err := os.Stat(processedPath); os.IsNotExist(err) {
+					if _, err := os.Stat(config.processedFolder); os.IsNotExist(err) {
 						// Create the "processed" folder
-						err := os.Mkdir(processedPath, 0755)
+						err := os.Mkdir(config.processedFolder, 0755)
 						if err != nil {
 							fmt.Println("Failed to create 'processed' folder:", err)
 							continue
 						}
 					}
 
-					processedFilePath := filepath.Join(processedPath, filepath.Base(event.Name))
+					processedFilePath := filepath.Join(config.processedFolder, filepath.Base(event.Name))
 					err = moveFileToProcessed(event.Name, file, processedFilePath)
 					if err != nil {
 						fmt.Println("Error moving file to 'processed' folder:", err)
@@ -150,47 +93,126 @@ func main() {
 			if !ok {
 				return
 			}
-			fmt.Println("Error watching folder:", err)
+			beeep.Alert("Error", "File watcher error: "+err.Error(), "error")
 		}
 	}
 }
 
-func processExistingFiles(folderToWatch string, sftpClient *sftp.Client, watchFileExtension string) error {
+func initialize() (*Config, *sftp.Client, *ssh.Client, *fsnotify.Watcher, bool) {
+	workDir, err := os.Getwd()
+	if err != nil {
+		beeep.Alert("Error", "Failed to get working directory: "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+
+	config, err := loadConfig(filepath.Join(workDir, "config.ini"))
+	if err != nil {
+		beeep.Alert("Error", "Failed to load configuration: "+err.Error(), "error")
+	}
+
+	privateKey, err := os.ReadFile(config.PrivateKeyPath)
+	if err != nil {
+		beeep.Alert("Error", "Failed to read private key: "+config.PrivateKeyPath+" - "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+
+	signer, err := ssh.ParsePrivateKey(privateKey)
+	if err != nil {
+		beeep.Alert("Error", "Failed to parse private key: "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+
+	sshConfig := &ssh.ClientConfig{
+		User: config.SftpUser,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	sshClient, err := ssh.Dial("tcp", config.SftpServer+":22", sshConfig)
+	if err != nil {
+		beeep.Alert("Error", "Failed to connect to SFTP server: "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+
+	sftpClient, err := sftp.NewClient(sshClient)
+	if err != nil {
+		beeep.Alert("Error", "Failed to create SFTP client: "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+
+	err = processExistingFiles(config.FolderToWatch, sftpClient, *config)
+	if err != nil {
+		beeep.Alert("Error", "Failed to process existing files: "+err.Error(), "error")
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		beeep.Alert("Error", "Failed to create file watcher: "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+
+	err = watcher.Add(config.FolderToWatch)
+	if err != nil {
+		beeep.Alert("Error", "Failed to watch folder: "+err.Error(), "error")
+		return nil, nil, nil, nil, true
+	}
+	fmt.Println("Watching " + config.FolderToWatch + " folder for new files...")
+	return config, sftpClient, sshClient, watcher, false
+}
+
+func processExistingFiles(folderToWatch string, sftpClient *sftp.Client, config Config) error {
 	// Process existing files in the folder
 	files, err := os.ReadDir(folderToWatch)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read directory: %w", err)
 	}
 
 	for _, fileInfo := range files {
-		if !fileInfo.IsDir() && filepath.Ext(fileInfo.Name()) == watchFileExtension {
+		if !fileInfo.IsDir() && hasExtension(fileInfo.Name(), config.WatchExtensions) {
 			// Open the file
 			file, err := os.Open(filepath.Join(folderToWatch, fileInfo.Name()))
 			if err != nil {
-				fmt.Println("Failed to open file:", err)
+				beeep.Alert("Error", fmt.Sprintf("Failed to open file: %s", err.Error()), "error")
 				continue
 			}
 			defer file.Close()
 
-			// Create remote file
-			remoteFile, err := sftpClient.Create(fileInfo.Name())
+			err = copyFileToSftp(file, sftpClient, config.destionationFolder)
 			if err != nil {
-				fmt.Println("Failed to create remote file:", err)
-				continue
+				log.Println("Error copying file to SFTP server:", err)
 			}
 
-			// Copy the contents of the local file to the remote file
-			_, err = io.Copy(remoteFile, file)
+			err = moveFileToProcessed(filepath.Join(folderToWatch, fileInfo.Name()), file, filepath.Join(config.processedFolder, fileInfo.Name()))
 			if err != nil {
-				fmt.Println("Failed to upload file to SFTP server:", err)
-				continue
+				log.Println("Error moving file to 'processed' folder:", err)
 			}
-
-			fmt.Println("Processed existing file:", fileInfo.Name())
 		}
 	}
 
 	return nil
+}
+
+func copyFileToSftp(file *os.File, sftpClient *sftp.Client, destFolder string) error {
+	fmt.Println("creating remote file: " + destFolder + filepath.Base(file.Name()))
+	// Create remote file
+	remoteFile, err := sftpClient.Create(destFolder + filepath.Base(file.Name()))
+	if err != nil {
+		fmt.Println("Failed to create remote file:", err)
+		return err
+	}
+
+	// Copy the contents of the local file to the remote file
+	_, err = io.Copy(remoteFile, file)
+	if err != nil {
+		fmt.Println("Failed to upload file to SFTP server:", err)
+		return err
+	}
+
+	fmt.Println("File uploaded successfully")
+	return nil
+
 }
 
 func moveFileToProcessed(srcFilePath string, file *os.File, processedPath string) error {
@@ -217,4 +239,36 @@ func moveFileToProcessed(srcFilePath string, file *os.File, processedPath string
 		return err
 	}
 	return nil
+}
+
+func loadConfig(filename string) (*Config, error) {
+	cfg, err := ini.Load(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load configuration: %w", err)
+	}
+
+	config := &Config{}
+
+	// Read values from the ini file
+	config.FolderToWatch = cfg.Section("paths").Key("FolderToWatch").String()
+	config.SftpServer = cfg.Section("server").Key("SftpServer").String()
+	config.SftpUser = cfg.Section("server").Key("SftpUser").String()
+	config.PrivateKeyPath = cfg.Section("paths").Key("PrivateKeyPath").String()
+	config.destionationFolder = cfg.Section("server").Key("DestinationFolder").String()
+	config.processedFolder = filepath.Join(config.FolderToWatch, "processed")
+
+	// Read list of file extensions to watch
+	config.WatchExtensions = cfg.Section("general").Key("WatchFileExtension").Strings(",")
+
+	return config, nil
+}
+
+func hasExtension(filename string, extensions []string) bool {
+	ext := filepath.Ext(filename)
+	for _, e := range extensions {
+		if e == ext {
+			return true
+		}
+	}
+	return false
 }
