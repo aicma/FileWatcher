@@ -1,3 +1,5 @@
 alpineGlowFileWatcher
 alpineGlowFileWatcher.exe
 config.ini
+build/**/*
+*.exe
