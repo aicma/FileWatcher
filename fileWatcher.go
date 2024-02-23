@@ -18,6 +18,7 @@ type Config struct {
 	FolderToWatch      string
 	SftpServer         string
 	SftpUser           string
+	SftpPassword       string
 	PrivateKeyPath     string
 	WatchExtensions    []string
 	destionationFolder string
@@ -69,8 +70,6 @@ func main() {
 						continue
 					}
 
-					fmt.Println("File uploaded successfully")
-
 					// Check if the "processed" folder exists
 					if _, err := os.Stat(config.processedFolder); os.IsNotExist(err) {
 						// Create the "processed" folder
@@ -109,24 +108,33 @@ func initialize() (*Config, *sftp.Client, *ssh.Client, *fsnotify.Watcher, bool) 
 	if err != nil {
 		beeep.Alert("Error", "Failed to load configuration: "+err.Error(), "error")
 	}
+	var auth []ssh.AuthMethod
+	var user string
+	if config.PrivateKeyPath != "" {
+		privateKey, err := os.ReadFile(config.PrivateKeyPath)
+		if err != nil {
+			beeep.Alert("Error", "Failed to read private key: "+config.PrivateKeyPath+" - "+err.Error(), "error")
+			return nil, nil, nil, nil, true
+		}
 
-	privateKey, err := os.ReadFile(config.PrivateKeyPath)
-	if err != nil {
-		beeep.Alert("Error", "Failed to read private key: "+config.PrivateKeyPath+" - "+err.Error(), "error")
-		return nil, nil, nil, nil, true
-	}
-
-	signer, err := ssh.ParsePrivateKey(privateKey)
-	if err != nil {
-		beeep.Alert("Error", "Failed to parse private key: "+err.Error(), "error")
-		return nil, nil, nil, nil, true
-	}
-
-	sshConfig := &ssh.ClientConfig{
-		User: config.SftpUser,
-		Auth: []ssh.AuthMethod{
+		signer, err := ssh.ParsePrivateKey(privateKey)
+		if err != nil {
+			beeep.Alert("Error", "Failed to parse private key: "+err.Error(), "error")
+			return nil, nil, nil, nil, true
+		}
+		auth = []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
-		},
+		}
+		user = config.SftpUser
+	} else {
+		auth = []ssh.AuthMethod{
+			ssh.Password(config.SftpPassword),
+		}
+		user = config.SftpUser
+	}
+	sshConfig := &ssh.ClientConfig{
+		User:            user,
+		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
@@ -158,7 +166,9 @@ func initialize() (*Config, *sftp.Client, *ssh.Client, *fsnotify.Watcher, bool) 
 		beeep.Alert("Error", "Failed to watch folder: "+err.Error(), "error")
 		return nil, nil, nil, nil, true
 	}
+
 	fmt.Println("Watching " + config.FolderToWatch + " folder for new files...")
+
 	return config, sftpClient, sshClient, watcher, false
 }
 
@@ -253,6 +263,7 @@ func loadConfig(filename string) (*Config, error) {
 	config.FolderToWatch = cfg.Section("paths").Key("FolderToWatch").String()
 	config.SftpServer = cfg.Section("server").Key("SftpServer").String()
 	config.SftpUser = cfg.Section("server").Key("SftpUser").String()
+	config.SftpPassword = cfg.Section("server").Key("SftpPassword").String()
 	config.PrivateKeyPath = cfg.Section("paths").Key("PrivateKeyPath").String()
 	config.destionationFolder = cfg.Section("server").Key("DestinationFolder").String()
 	config.processedFolder = filepath.Join(config.FolderToWatch, "processed")
